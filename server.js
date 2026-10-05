@@ -8,11 +8,39 @@ const app = express();
 app.use(cors());
 app.use(express.raw({ type: "*/*" }));
 
-// Resolve hostname via DNS-over-HTTPS (bypasses broken system DNS)
+// Debug endpoint — shows what DoH providers return for a hostname
+app.get("/debug", async (req, res) => {
+  const hostname = req.query.host || "api2-us.libreview.io";
+  const results = {};
+
+  const dohUrls = [
+    `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
+    `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=CNAME`,
+    `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=ANY`,
+    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`,
+    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=CNAME`,
+    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=ANY`,
+    `https://dns.google/resolve?name=${encodeURIComponent("libreview.io")}&type=ANY`,
+    `https://dns.google/resolve?name=${encodeURIComponent("libreview.io")}&type=NS`,
+  ];
+
+  for (const dohUrl of dohUrls) {
+    const label = dohUrl.replace(/https:\/\/[^/]+/, "").substring(0, 80);
+    try {
+      const r = await fetch(dohUrl, { headers: { Accept: "application/dns-json" } });
+      const data = await r.json();
+      results[label] = data;
+    } catch (e) {
+      results[label] = { error: e.message };
+    }
+  }
+
+  res.json(results);
+});
+
 async function resolveViaDoH(hostname) {
   const dohUrls = [
     `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
-    `https://8.8.8.8/resolve?name=${encodeURIComponent(hostname)}&type=A`,
     `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`,
   ];
 
@@ -22,18 +50,18 @@ async function resolveViaDoH(hostname) {
         headers: { Accept: "application/dns-json" },
       });
       const data = await res.json();
+      console.log(`DoH ${dohUrl} =>`, JSON.stringify(data).substring(0, 500));
 
       if (data.Answer) {
-        // Look for A records (type 1)
         const aRecords = data.Answer.filter((r) => r.type === 1);
         if (aRecords.length > 0) {
           return aRecords[0].data;
         }
 
-        // Follow CNAME (type 5)
         const cname = data.Answer.find((r) => r.type === 5);
         if (cname) {
           const target = cname.data.replace(/\.$/, "");
+          console.log(`Following CNAME ${hostname} -> ${target}`);
           return await resolveViaDoH(target);
         }
       }
@@ -45,58 +73,12 @@ async function resolveViaDoH(hostname) {
   throw new Error(`Could not resolve ${hostname} via DoH`);
 }
 
-function makeRequest(targetUrl, method, headers, body, redirectCount = 0) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(targetUrl);
-    const isHttps = parsed.protocol === "https:";
-    const lib = isHttps ? https : http;
-
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (isHttps ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: method,
-      headers: { ...headers, host: parsed.hostname },
-      servername: parsed.hostname,
-    };
-
-    const req = lib.request(options, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectCount < 5) {
-        const redirectUrl = new URL(res.headers.location, targetUrl).href;
-        makeRequest(redirectUrl, method, headers, body, redirectCount + 1).then(resolve).catch(reject);
-        return;
-      }
-
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: Buffer.concat(chunks),
-        });
-      });
-    });
-
-    req.on("error", reject);
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("Request timeout"));
-    });
-
-    if (body) {
-      req.write(body);
-    }
-    req.end();
-  });
-}
-
 async function makeRequestWithDoH(targetUrl, method, headers, body) {
   const parsed = new URL(targetUrl);
   const ip = await resolveViaDoH(parsed.hostname);
 
   console.log(`Resolved ${parsed.hostname} to ${ip}`);
 
-  // Connect to the IP directly, but use the real hostname for SNI and Host header
   const isHttps = parsed.protocol === "https:";
   const lib = isHttps ? https : http;
 
