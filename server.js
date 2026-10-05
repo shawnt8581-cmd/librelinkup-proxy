@@ -1,9 +1,74 @@
 import express from "express";
 import cors from "cors";
+import https from "node:https";
+import http from "node:http";
+import dns from "node:dns";
+import { URL } from "node:url";
 
 const app = express();
 app.use(cors());
 app.use(express.raw({ type: "*/*" }));
+
+// Use Google's public DNS to bypass Render's DNS resolver
+const resolver = new dns.Resolver();
+resolver.setServers(["8.8.8.8", "8.8.4.4"]);
+
+function customLookup(hostname, options, callback) {
+  resolver.resolve4(hostname, (err, addresses) => {
+    if (err) return callback(err);
+    if (options.all) {
+      callback(null, addresses.map((addr) => ({ address: addr, family: 4 })));
+    } else {
+      callback(null, addresses[0], 4);
+    }
+  });
+}
+
+function makeRequest(targetUrl, method, headers, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(targetUrl);
+    const isHttps = parsed.protocol === "https:";
+    const lib = isHttps ? https : http;
+
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: method,
+      headers: headers,
+      lookup: customLookup,
+    };
+
+    const req = lib.request(options, (res) => {
+      // Handle redirects
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        const redirectUrl = new URL(res.headers.location, targetUrl).href;
+        makeRequest(redirectUrl, method, headers, body).then(resolve).catch(reject);
+        return;
+      }
+
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks),
+        });
+      });
+    });
+
+    req.on("error", reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error("Request timeout"));
+    });
+
+    if (body) {
+      req.write(body);
+    }
+    req.end();
+  });
+}
 
 const BASE_URLS = {
   us: "https://api2-us.libreview.io",
@@ -59,28 +124,28 @@ app.all("*", async (req, res) => {
   delete forwardHeaders["true-client-ip"];
   delete forwardHeaders["render-proxy-ttl"];
   delete forwardHeaders["rndr-id"];
+  delete forwardHeaders["accept-encoding"];
 
   try {
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers: forwardHeaders,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-      redirect: "follow",
-    });
+    const response = await makeRequest(
+      targetUrl,
+      req.method,
+      forwardHeaders,
+      ["GET", "HEAD"].includes(req.method) ? null : req.body
+    );
 
-    const body = await response.arrayBuffer();
     res.set("Access-Control-Allow-Origin", "*");
     res.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
     res.set("Access-Control-Allow-Headers", "*");
     res.set("Access-Control-Expose-Headers", "*");
 
-    response.headers.forEach((v, k) => {
-      if (!["transfer-encoding", "content-encoding"].includes(k.toLowerCase())) {
+    Object.entries(response.headers).forEach(([k, v]) => {
+      if (!["transfer-encoding", "content-encoding", "connection"].includes(k.toLowerCase())) {
         res.set(k, v);
       }
     });
 
-    res.status(response.status).send(Buffer.from(body));
+    res.status(response.status).send(response.body);
   } catch (err) {
     console.error("Proxy error:", err);
     res.status(502).json({
