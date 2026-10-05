@@ -2,114 +2,54 @@ import express from "express";
 import cors from "cors";
 import https from "node:https";
 import http from "node:http";
-import dns from "node:dns";
 import { URL } from "node:url";
 
 const app = express();
 app.use(cors());
 app.use(express.raw({ type: "*/*" }));
 
-// Debug endpoint
+// Debug endpoint — check many possible LibreLinkUp hostnames
 app.get("/debug", async (req, res) => {
-  const hostname = req.query.host || "api2-us.libreview.io";
+  const hostnames = [
+    "api2-us.libreview.io",
+    "api2-eu.libreview.io",
+    "api-us.libreview.io",
+    "api-eu.libreview.io",
+    "api2.libreview.io",
+    "api.libreview.io",
+    "api2-us.librelinkup.io",
+    "api2-eu.librelinkup.io",
+    "api-us.librelinkup.io",
+    "api.librelinkup.io",
+    "api2-us.librelinkup.com",
+    "api-us.librelinkup.com",
+    "api.librelinkup.com",
+    "direct-api.libreview.io",
+    "direct.libreview.io",
+    "llu-api.libreview.io",
+    "www.libreview.io",
+    "libreview.io",
+    "api2-us.libreview.com",
+    "api-us.libreview.com",
+    "api.libreview.com",
+  ];
+
   const results = {};
 
-  // 1. Try system DNS
-  try {
-    const sysRes = await new Promise((resolve, reject) => {
-      dns.lookup(hostname, { all: true }, (err, addrs) => {
-        if (err) reject(err);
-        else resolve(addrs);
-      });
-    });
-    results.system_dns = sysRes;
-  } catch (e) {
-    results.system_dns = { error: e.message };
-  }
-
-  // 2. Try DoH via Google
-  try {
-    const r = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`);
-    results.google_doh = await r.json();
-  } catch (e) {
-    results.google_doh = { error: e.message };
-  }
-
-  // 3. Try DoH via Cloudflare
-  try {
-    const r = await fetch(`https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=A`, {
-      headers: { Accept: "application/dns-json" },
-    });
-    results.cloudflare_doh = await r.json();
-  } catch (e) {
-    results.cloudflare_doh = { error: e.message };
-  }
-
-  // 4. Try querying Cloudflare's authoritative NS directly
-  try {
-    const nsResolver = new dns.Resolver();
-    // ace.ns.cloudflare.com IPs
-    nsResolver.setServers(["108.162.192.1", "173.245.58.1"]);
-    const nsResult = await new Promise((resolve, reject) => {
-      nsResolver.resolve4(hostname, (err, addrs) => {
-        if (err) reject(err);
-        else resolve(addrs);
-      });
-    });
-    results.authoritative_ns = nsResult;
-  } catch (e) {
-    results.authoritative_ns = { error: e.message, code: e.code };
-  }
-
-  // 5. Try connecting to Cloudflare edge IPs directly
-  const cfEdgeIPs = ["104.16.0.1", "172.64.0.1", "1.1.1.1"];
-  for (const ip of cfEdgeIPs) {
+  for (const hostname of hostnames) {
     try {
-      const testResult = await new Promise((resolve, reject) => {
-        const testReq = https.request({
-          hostname: ip,
-          port: 443,
-          path: "/",
-          method: "GET",
-          servername: hostname,
-          headers: { Host: hostname, "User-Agent": "Mozilla/5.0" },
-          timeout: 5000,
-        }, (testRes) => {
-          let body = "";
-          testRes.on("data", (chunk) => body += chunk);
-          testRes.on("end", () => {
-            resolve({
-              status: testRes.statusCode,
-              headers: { server: testRes.headers.server, "cf-ray": testRes.headers["cf-ray"] },
-              body: body.substring(0, 500),
-            });
-          });
-        });
-        testReq.on("error", reject);
-        testReq.on("timeout", () => {
-          testReq.destroy(new Error("timeout"));
-        });
-        testReq.end();
+      const r = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`, {
+        headers: { Accept: "application/dns-json" },
       });
-      results["edge_ip_" + ip] = testResult;
+      const data = await r.json();
+      const hasAnswer = data.Answer && data.Answer.length > 0;
+      results[hostname] = {
+        resolves: hasAnswer,
+        records: hasAnswer ? data.Answer.map((a) => `${a.type === 1 ? "A" : a.type === 5 ? "CNAME" : "type" + a.type} -> ${a.data}`) : null,
+      };
     } catch (e) {
-      results["edge_ip_" + ip] = { error: e.message };
+      results[hostname] = { resolves: false, error: e.message };
     }
-  }
-
-  // 6. Try native fetch to the URL
-  try {
-    const r = await fetch(`https://${hostname}/`, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(5000),
-    });
-    results.native_fetch = {
-      status: r.status,
-      headers: { server: r.headers.get("server"), "cf-ray": r.headers.get("cf-ray") },
-      body: (await r.text()).substring(0, 500),
-    };
-  } catch (e) {
-    results.native_fetch = { error: e.message, cause: e.cause ? e.cause.message : null };
   }
 
   res.json(results);
@@ -143,36 +83,7 @@ async function resolveViaDoH(hostname) {
     }
   }
 
-  // Fallback: try Cloudflare edge IPs directly
-  const cfEdgeIPs = ["104.16.0.1", "172.64.0.1", "1.1.1.1"];
-  for (const ip of cfEdgeIPs) {
-    try {
-      const testResult = await new Promise((resolve, reject) => {
-        const testReq = https.request({
-          hostname: ip,
-          port: 443,
-          path: "/",
-          method: "HEAD",
-          servername: hostname,
-          headers: { Host: hostname },
-          timeout: 3000,
-        }, (testRes) => {
-          resolve({ status: testRes.statusCode });
-        });
-        testReq.on("error", reject);
-        testReq.on("timeout", () => testReq.destroy(new Error("timeout")));
-        testReq.end();
-      });
-      if (testResult.status && testResult.status < 500) {
-        console.log(`Using Cloudflare edge IP ${ip} for ${hostname}`);
-        return ip;
-      }
-    } catch (e) {
-      // try next
-    }
-  }
-
-  throw new Error(`Could not resolve ${hostname} via DoH or edge IPs`);
+  throw new Error(`Could not resolve ${hostname} via DoH`);
 }
 
 async function makeRequestWithDoH(targetUrl, method, headers, body) {
@@ -254,7 +165,7 @@ app.all("*", async (req, res) => {
   }
 
   if (!targetUrl) {
-    const region = req.query.region || "us";
+    const region = url.searchParams.get("region") || "us";
     const base = BASE_URLS[region] || BASE_URLS.us;
     targetUrl = base + req.path;
     const u = new URL(targetUrl);
