@@ -50,6 +50,15 @@ app.all("*", async (req, res) => {
   delete forwardHeaders.referer;
   delete forwardHeaders["x-forwarded-for"];
   delete forwardHeaders["x-real-ip"];
+  delete forwardHeaders["cdn-loop"];
+  delete forwardHeaders["cf-connecting-ip"];
+  delete forwardHeaders["cf-ipcountry"];
+  delete forwardHeaders["cf-ray"];
+  delete forwardHeaders["cf-visitor"];
+  delete forwardHeaders["cf-worker"];
+  delete forwardHeaders["true-client-ip"];
+  delete forwardHeaders["render-proxy-ttl"];
+  delete forwardHeaders["rndr-id"];
 
   try {
     const response = await fetch(targetUrl, {
@@ -73,7 +82,14 @@ app.all("*", async (req, res) => {
 
     res.status(response.status).send(Buffer.from(body));
   } catch (err) {
-    res.status(502).json({ error: "Proxy Error", message: err.message, target: targetUrl });
+    console.error("Proxy error:", err);
+    res.status(502).json({
+      error: "Proxy Error",
+      message: err.message,
+      cause: err.cause ? err.cause.message : null,
+      code: err.cause ? err.cause.code : null,
+      target: targetUrl,
+    });
   }
 });
 
