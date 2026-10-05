@@ -2,73 +2,47 @@ import express from "express";
 import cors from "cors";
 import https from "node:https";
 import http from "node:http";
-import dns from "node:dns";
 import { URL } from "node:url";
 
 const app = express();
 app.use(cors());
 app.use(express.raw({ type: "*/*" }));
 
-// Use Cloudflare's DNS (1.1.1.1) and Google's (8.8.8.8)
-const resolver = new dns.Resolver();
-resolver.setServers(["1.1.1.1", "8.8.8.8"]);
+// Resolve hostname via DNS-over-HTTPS (bypasses broken system DNS)
+async function resolveViaDoH(hostname) {
+  const dohUrls = [
+    `https://1.1.1.1/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
+    `https://8.8.8.8/resolve?name=${encodeURIComponent(hostname)}&type=A`,
+    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`,
+  ];
 
-function customLookup(hostname, options, callback) {
-  // First try A records
-  resolver.resolve4(hostname, (err, addresses) => {
-    if (!err && addresses && addresses.length > 0) {
-      if (options.all) {
-        callback(null, addresses.map((addr) => ({ address: addr, family: 4 })));
-      } else {
-        callback(null, addresses[0], 4);
-      }
-      return;
-    }
+  for (const dohUrl of dohUrls) {
+    try {
+      const res = await fetch(dohUrl, {
+        headers: { Accept: "application/dns-json" },
+      });
+      const data = await res.json();
 
-    // If no A records, try CNAME, then resolve the target
-    resolver.resolveCname(hostname, (cerr, cnames) => {
-      if (!cerr && cnames && cnames.length > 0) {
-        // Recursively resolve the CNAME target
-        customLookup(cnames[0], options, callback);
-        return;
-      }
-
-      // Try AAAA records as fallback
-      resolver.resolve6(hostname, (verr, v6addresses) => {
-        if (!verr && v6addresses && v6addresses.length > 0) {
-          if (options.all) {
-            callback(null, v6addresses.map((addr) => ({ address: addr, family: 6 })));
-          } else {
-            callback(null, v6addresses[0], 6);
-          }
-          return;
+      if (data.Answer) {
+        // Look for A records (type 1)
+        const aRecords = data.Answer.filter((r) => r.type === 1);
+        if (aRecords.length > 0) {
+          return aRecords[0].data;
         }
 
-        // Last resort: try resolveAny
-        resolver.resolveAny(hostname, (aerr, records) => {
-          if (!aerr && records && records.length > 0) {
-            for (const r of records) {
-              if (r.type === "A" && r.address) {
-                callback(null, r.address, 4);
-                return;
-              }
-              if (r.type === "CNAME" && r.value) {
-                customLookup(r.value, options, callback);
-                return;
-              }
-              if (r.type === "AAAA" && r.address) {
-                callback(null, r.address, 6);
-                return;
-              }
-            }
-          }
+        // Follow CNAME (type 5)
+        const cname = data.Answer.find((r) => r.type === 5);
+        if (cname) {
+          const target = cname.data.replace(/\.$/, "");
+          return await resolveViaDoH(target);
+        }
+      }
+    } catch (e) {
+      console.error(`DoH failed for ${dohUrl}:`, e.message);
+    }
+  }
 
-          // Final fallback: use the system default lookup
-          dns.lookup(hostname, options, callback);
-        });
-      });
-    });
-  });
+  throw new Error(`Could not resolve ${hostname} via DoH`);
 }
 
 function makeRequest(targetUrl, method, headers, body, redirectCount = 0) {
@@ -82,8 +56,7 @@ function makeRequest(targetUrl, method, headers, body, redirectCount = 0) {
       port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
       method: method,
-      headers: headers,
-      lookup: customLookup,
+      headers: { ...headers, host: parsed.hostname },
       servername: parsed.hostname,
     };
 
@@ -91,6 +64,57 @@ function makeRequest(targetUrl, method, headers, body, redirectCount = 0) {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectCount < 5) {
         const redirectUrl = new URL(res.headers.location, targetUrl).href;
         makeRequest(redirectUrl, method, headers, body, redirectCount + 1).then(resolve).catch(reject);
+        return;
+      }
+
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks),
+        });
+      });
+    });
+
+    req.on("error", reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error("Request timeout"));
+    });
+
+    if (body) {
+      req.write(body);
+    }
+    req.end();
+  });
+}
+
+async function makeRequestWithDoH(targetUrl, method, headers, body) {
+  const parsed = new URL(targetUrl);
+  const ip = await resolveViaDoH(parsed.hostname);
+
+  console.log(`Resolved ${parsed.hostname} to ${ip}`);
+
+  // Connect to the IP directly, but use the real hostname for SNI and Host header
+  const isHttps = parsed.protocol === "https:";
+  const lib = isHttps ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: ip,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: method,
+      headers: { ...headers, host: parsed.hostname },
+      servername: parsed.hostname,
+      rejectUnauthorized: true,
+    };
+
+    const req = lib.request(options, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        const redirectUrl = new URL(res.headers.location, targetUrl).href;
+        makeRequestWithDoH(redirectUrl, method, headers, body).then(resolve).catch(reject);
         return;
       }
 
@@ -174,7 +198,7 @@ app.all("*", async (req, res) => {
   delete forwardHeaders["accept-encoding"];
 
   try {
-    const response = await makeRequest(
+    const response = await makeRequestWithDoH(
       targetUrl,
       req.method,
       forwardHeaders,
