@@ -9,22 +9,69 @@ const app = express();
 app.use(cors());
 app.use(express.raw({ type: "*/*" }));
 
-// Use Google's public DNS to bypass Render's DNS resolver
+// Use Cloudflare's DNS (1.1.1.1) and Google's (8.8.8.8)
 const resolver = new dns.Resolver();
-resolver.setServers(["8.8.8.8", "8.8.4.4"]);
+resolver.setServers(["1.1.1.1", "8.8.8.8"]);
 
 function customLookup(hostname, options, callback) {
+  // First try A records
   resolver.resolve4(hostname, (err, addresses) => {
-    if (err) return callback(err);
-    if (options.all) {
-      callback(null, addresses.map((addr) => ({ address: addr, family: 4 })));
-    } else {
-      callback(null, addresses[0], 4);
+    if (!err && addresses && addresses.length > 0) {
+      if (options.all) {
+        callback(null, addresses.map((addr) => ({ address: addr, family: 4 })));
+      } else {
+        callback(null, addresses[0], 4);
+      }
+      return;
     }
+
+    // If no A records, try CNAME, then resolve the target
+    resolver.resolveCname(hostname, (cerr, cnames) => {
+      if (!cerr && cnames && cnames.length > 0) {
+        // Recursively resolve the CNAME target
+        customLookup(cnames[0], options, callback);
+        return;
+      }
+
+      // Try AAAA records as fallback
+      resolver.resolve6(hostname, (verr, v6addresses) => {
+        if (!verr && v6addresses && v6addresses.length > 0) {
+          if (options.all) {
+            callback(null, v6addresses.map((addr) => ({ address: addr, family: 6 })));
+          } else {
+            callback(null, v6addresses[0], 6);
+          }
+          return;
+        }
+
+        // Last resort: try resolveAny
+        resolver.resolveAny(hostname, (aerr, records) => {
+          if (!aerr && records && records.length > 0) {
+            for (const r of records) {
+              if (r.type === "A" && r.address) {
+                callback(null, r.address, 4);
+                return;
+              }
+              if (r.type === "CNAME" && r.value) {
+                customLookup(r.value, options, callback);
+                return;
+              }
+              if (r.type === "AAAA" && r.address) {
+                callback(null, r.address, 6);
+                return;
+              }
+            }
+          }
+
+          // Final fallback: use the system default lookup
+          dns.lookup(hostname, options, callback);
+        });
+      });
+    });
   });
 }
 
-function makeRequest(targetUrl, method, headers, body) {
+function makeRequest(targetUrl, method, headers, body, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
     const isHttps = parsed.protocol === "https:";
@@ -37,13 +84,13 @@ function makeRequest(targetUrl, method, headers, body) {
       method: method,
       headers: headers,
       lookup: customLookup,
+      servername: parsed.hostname,
     };
 
     const req = lib.request(options, (res) => {
-      // Handle redirects
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectCount < 5) {
         const redirectUrl = new URL(res.headers.location, targetUrl).href;
-        makeRequest(redirectUrl, method, headers, body).then(resolve).catch(reject);
+        makeRequest(redirectUrl, method, headers, body, redirectCount + 1).then(resolve).catch(reject);
         return;
       }
 
