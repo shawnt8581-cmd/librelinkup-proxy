@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import { fetch } from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -23,12 +22,10 @@ app.options("*", (req, res) => res.sendStatus(204));
 app.all("*", async (req, res) => {
   let targetUrl = null;
 
-  // Format 1: ?url= query param
   if (req.query.url) {
     targetUrl = req.query.url;
   }
 
-  // Format 2: full URL in path
   if (!targetUrl) {
     const path = req.path.substring(1);
     if (path.startsWith("http://") || path.startsWith("https://")) {
@@ -36,12 +33,10 @@ app.all("*", async (req, res) => {
     }
   }
 
-  // Format 3: path-based with region param
   if (!targetUrl) {
     const region = req.query.region || "us";
     const base = BASE_URLS[region] || BASE_URLS.us;
     targetUrl = base + req.path;
-    // Append remaining query params
     const u = new URL(targetUrl);
     Object.entries(req.query).forEach(([k, v]) => {
       if (k !== "region") u.searchParams.append(k, v);
